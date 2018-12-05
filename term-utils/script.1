@@ -31,13 +31,18 @@
 .\"
 .\"	@(#)script.1	6.5 (Berkeley) 7/27/91
 .\"
-.TH SCRIPT "1" "June 2014" "util-linux" "User Commands"
+.TH SCRIPT "1" "December 2018" "util-linux" "User Commands"
 .SH NAME
 script \- make typescript of terminal session
 .SH SYNOPSIS
 .B script
 [options]
 .RI [ file ]
+.PP
+.B script
+[options]
+.RI [ cmd
+.RI [ args... ]]
 .SH DESCRIPTION
 .B script
 makes a typescript of everything displayed on your terminal.  It is useful for
@@ -45,14 +50,31 @@ students who need a hardcopy record of an interactive session as proof of an
 assignment, as the typescript file can be printed out later with
 .BR lpr (1).
 .PP
-If the argument
-.I file
-is given,
 .B script
-saves the dialogue in this
-.IR file .
-If no filename is given, the dialogue is saved in the file
+in its second form can stream its output to a command.  This is useful to link
+to a variety of forms of sharing, including interactively through a command
+like
+.BR nc (1).
+.PP
+The first form is assumed when one or no
+.I file
+argument is supplied but no
+.I -s
+option.
+In this case, the dialogue is saved in
+.I file
+or, if this is not supplied, in the default output file
 .BR typescript .
+.PP
+The second form is assumed in the other cases,
+and the dialogue is then streamed to the standard input of
+.I cmd [args...]
+or, if this is not supplied, to the standard input of
+the default streaming command
+.BR scriptstream .
+Note that the default streaming command is not installed along with
+.BR script ,
+as it is intended to facilitate locally meaningful streaming options.
 .SH OPTIONS
 Below, the \fIsize\fR argument may be followed by the multiplicative
 suffixes KiB (=1024), MiB (=1024*1024), and so on for GiB, TiB, PiB, EiB, ZiB and YiB
@@ -65,6 +87,7 @@ Append the output to
 or to
 .BR typescript ,
 retaining the prior contents.
+This is ignored when streaming to a command.
 .TP
 \fB\-c\fR, \fB\-\-command\fR \fIcommand\fR
 Run the
@@ -82,6 +105,7 @@ the child process is always stored in type script file too.
 Flush output after each write.  This is nice for telecooperation: one person
 does `mkfifo foo; script -f foo', and another can supervise real-time what is
 being done using `cat foo'.
+This behaviour is implied for output to a streaming command.
 .TP
 \fB\-\-force\fR
 Allow the default output destination, i.e. the typescript file, to be a hard
@@ -98,6 +122,20 @@ Due to buffering, the resulting output file might be larger than the specified v
 .TP
 \fB\-q\fR, \fB\-\-quiet\fR
 Be quiet (do not write start and done messages to standard output).
+.TP
+\fB\-s\fR, \fB\-\-stream\fR
+Do not output to a file, but to a streaming command.  This option is
+implied when more than a single
+.I file
+is given, as that can only be meaningfully interpreted as the form
+.I cmd args...
+but the option must be specified when streaming to the form
+.I cmd
+or when no command is specified at all.  In the latter case, the
+default command
+.B scriptstream
+is started.  This command is not installed by default, but may be
+created to obtain locally useful default behaviour.
 .TP
 \fB\-t\fR[\fIfile\fR], \fB\-\-timing\fR[=\fIfile\fR]
 Output timing data to standard error, or to
@@ -162,6 +200,29 @@ You should also avoid use of script in command pipes, as
 .B script
 can read more input than you would expect.
 .PP
+An example of a
+.B scriptstream
+command that would stream information to a certain port on a
+certain server could be
+.RS
+.RE
+.sp
+.na
+.RS
+.nf
+#!/bin/sh
+#
+# /usr/local/bin/scriptstream -- used for "script -s"
+#
+nc -q0 2001:db8::1234 5678 | sed 's/$/\\r/'
+.fi
+.RE
+.ad
+.PP
+Note how
+.IR nc (1)
+is said to terminate when reading EOF, and line endings of
+any output is mapped from LF to CRLF.
 .SH ENVIRONMENT
 The following environment variable is utilized by
 .BR script :

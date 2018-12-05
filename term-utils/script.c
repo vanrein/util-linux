@@ -39,6 +39,9 @@
  *
  * 2014-05-30 Csaba Kos <csaba.kos@gmail.com>
  * - fixed a rare deadlock after child termination
+ *
+ * 2018-12-05 Rick van Rein <rick@openfortress.nl>
+ * - added streaming command as an output option
  */
 
 #include <stdio.h>
@@ -97,12 +100,16 @@ UL_DEBUG_DEFINE_MASKNAMES(script) = UL_DEBUG_EMPTY_MASKNAMES;
 #endif
 
 #define DEFAULT_TYPESCRIPT_FILENAME "typescript"
+#define DEFAULT_TYPESCRIPT_COMMAND  "scriptstream"
 
 struct script_control {
 	char *shell;		/* shell to be executed */
 	char *command;		/* command to be executed */
 	char *fname;		/* output file path */
 	FILE *typescriptfp;	/* output file pointer */
+	int stream;		/* output to streaming command */
+	char **streamcmd;	/* streaming command */
+	char *minicmd [2];	/* storage for a mini streaming command */
 	char *tname;		/* timing file path */
 	FILE *timingfp;		/* timing file pointer */
 	uint64_t outsz;         /* current output file size */
@@ -112,7 +119,9 @@ struct script_control {
 	int slave;		/* pseudoterminal slave file descriptor */
 	int poll_timeout;	/* poll() timeout, used in end of execution */
 	pid_t child;		/* child pid */
+	pid_t streampid;	/* streaming process */
 	int childstatus;	/* child process exit value */
+	int streamstatus;	/* streaming process exit value */
 	struct termios attrs;	/* slave terminal runtime attributes */
 	struct winsize win;	/* terminal window size */
 #if !HAVE_LIBUTIL || !HAVE_PTY_H
@@ -161,7 +170,7 @@ static void __attribute__((__noreturn__)) usage(void)
 {
 	FILE *out = stdout;
 	fputs(USAGE_HEADER, out);
-	fprintf(out, _(" %s [options] [file]\n"), program_invocation_short_name);
+	fprintf(out, _(" %s [options] [file]\n %s [options] [cmd [args...]]\n"), program_invocation_short_name, program_invocation_short_name);
 
 	fputs(USAGE_SEPARATOR, out);
 	fputs(_("Make a typescript of a terminal session.\n"), out);
@@ -172,6 +181,7 @@ static void __attribute__((__noreturn__)) usage(void)
 		" -e, --return                  return exit code of the child process\n"
 		" -f, --flush                   run flush after each write\n"
 		"     --force                   use output file even when it is a link\n"
+		" -s, --stream                  do not output to file but to a streaming command\n"
 		" -o, --output-limit <size>     terminate if output files exceed size\n"
 		" -q, --quiet                   be quiet\n"
 		" -t[<file>], --timing[=<file>] output timing data to stderr or to FILE\n"
@@ -313,15 +323,27 @@ static void __attribute__((__noreturn__)) fail(struct script_control *ctl)
 
 static void wait_for_child(struct script_control *ctl, int wait)
 {
-	int status;
-	pid_t pid;
 	int options = wait ? 0 : WNOHANG;
 
 	DBG(MISC, ul_debug("waiting for child"));
 
-	while ((pid = wait3(&status, options, NULL)) > 0)
-		if (pid == ctl->child)
-			ctl->childstatus = status;
+	waitpid(ctl->child, &ctl->childstatus, options);
+}
+
+static void wait_for_stream_cmd(struct script_control *ctl, int wait)
+{
+	int options = wait ? 0 : WNOHANG;
+
+	if (ctl->stream && ctl->typescriptfp) {
+		DBG(MISC, ul_debug("closing stream subcommand"));
+		fclose (ctl->typescriptfp);
+		ctl->typescriptfp = NULL;
+		kill(ctl->streampid, SIGTERM);
+	}
+
+	DBG(MISC, ul_debug("waiting for stream subcommand"));
+
+	waitpid(ctl->streampid, &ctl->streamstatus, options);
 }
 
 static void write_output(struct script_control *ctl, char *obuf,
@@ -483,6 +505,7 @@ static void handle_signal(struct script_control *ctl, int fd)
 		    || info.ssi_code == CLD_KILLED
 		    || info.ssi_code == CLD_DUMPED) {
 			wait_for_child(ctl, 0);
+			wait_for_stream_cmd(ctl, 0);
 			ctl->poll_timeout = 10;
 
 		/* In case of ssi_code is CLD_TRAPPED, CLD_STOPPED, or CLD_CONTINUED */
@@ -519,6 +542,7 @@ static void handle_signal(struct script_control *ctl, int fd)
 static void do_io(struct script_control *ctl)
 {
 	int ret, eof = 0;
+	int cmdio[2];
 	time_t tvec = script_time((time_t *)NULL);
 	enum {
 		POLLFD_SIGNAL = 0,
@@ -533,9 +557,33 @@ static void do_io(struct script_control *ctl)
 	};
 
 
-	if ((ctl->typescriptfp =
-	     fopen(ctl->fname, ctl->append ? "a" UL_CLOEXECSTR : "w" UL_CLOEXECSTR)) == NULL) {
-
+	if (ctl->stream) {
+		if (pipe(cmdio) == -1) {
+			warn(_("pipe failed"));
+			fail(ctl);
+			exit(1);
+		}
+		ctl->streampid = fork();
+		switch (ctl->streampid) {
+		case -1: /* error */
+			warn(_("fork failed"));
+			fail(ctl);
+			exit(1);
+		case 0: /* child */
+			close(cmdio[1]);
+			dup2(cmdio[0],0);
+			execvp(ctl->streamcmd[0], ctl->streamcmd);
+			fprintf(stderr,_("streaming command failed: %s\r\n"),strerror(errno));
+			exit(1);
+			break;
+		default: /* parent */
+			close(cmdio[0]);
+			ctl->typescriptfp = fdopen(cmdio[1],"w");
+		}
+	} else {
+		ctl->typescriptfp = fopen(ctl->fname, ctl->append ? "a" UL_CLOEXECSTR : "w" UL_CLOEXECSTR);
+	}
+	if (ctl->typescriptfp == NULL) {
 		restore_tty(ctl, TCSANOW);
 		warn(_("cannot open %s"), ctl->fname);
 		fail(ctl);
@@ -622,6 +670,9 @@ static void do_io(struct script_control *ctl)
 		wait_for_child(ctl, 1);
 
 	done(ctl);
+
+	if (ctl->stream)
+		wait_for_stream_cmd(ctl, 1);
 }
 
 static void getslave(struct script_control *ctl)
@@ -775,6 +826,7 @@ int main(int argc, char **argv)
 		{"flush", no_argument, NULL, 'f'},
 		{"force", no_argument, NULL, FORCE_OPTION,},
 		{"output-limit", required_argument, NULL, 'o'},
+		{"stream", no_argument, NULL, 's'},
 		{"quiet", no_argument, NULL, 'q'},
 		{"timing", optional_argument, NULL, 't'},
 		{"version", no_argument, NULL, 'V'},
@@ -797,7 +849,7 @@ int main(int argc, char **argv)
 
 	script_init_debug();
 
-	while ((ch = getopt_long(argc, argv, "ac:efo:qt::Vh", longopts, NULL)) != -1)
+	while ((ch = getopt_long(argc, argv, "ac:efo:sqt::Vh", longopts, NULL)) != -1)
 		switch (ch) {
 		case 'a':
 			ctl.append = 1;
@@ -816,6 +868,10 @@ int main(int argc, char **argv)
 			break;
 		case 'o':
 			ctl.maxsz = strtosize_or_err(optarg, _("failed to parse output limit size"));
+			break;
+		case 's':
+			ctl.stream = 1;
+			ctl.flush = 1;
 			break;
 		case 'q':
 			ctl.quiet = 1;
@@ -837,12 +893,32 @@ int main(int argc, char **argv)
 		}
 	argc -= optind;
 	argv += optind;
+	assert (argv [argc] == NULL);
 
-	if (argc > 0)
-		ctl.fname = argv[0];
-	else {
-		ctl.fname = DEFAULT_TYPESCRIPT_FILENAME;
-		die_if_link(&ctl);
+	/* streaming may be ordered with option --stream or with argc > 1 */
+	if (argc == 0) {
+		if (ctl.stream) {
+			ctl.minicmd[0] = DEFAULT_TYPESCRIPT_COMMAND;
+			ctl.minicmd[1] = NULL;
+			ctl.streamcmd = &ctl.minicmd[0];
+		} else {
+			/* No default implementation to make this pluggable */
+			ctl.fname = DEFAULT_TYPESCRIPT_FILENAME;
+			die_if_link(&ctl);
+		}
+	} else if (argc == 1) {
+		if (ctl.stream) {
+			ctl.minicmd[0] = argv[0];
+			ctl.minicmd[1] = NULL;
+			ctl.streamcmd = &ctl.minicmd[0];
+		} else {
+			ctl.fname = argv[0];
+		}
+	} else {
+		/* implicit streaming for more than 1 command argument */
+		ctl.streamcmd = argv;
+		ctl.stream = 1;
+		ctl.flush = 1;
 	}
 
 	ctl.shell = getenv("SHELL");
@@ -850,8 +926,13 @@ int main(int argc, char **argv)
 		ctl.shell = _PATH_BSHELL;
 
 	getmaster(&ctl);
-	if (!ctl.quiet)
-		printf(_("Script started, file is %s\n"), ctl.fname);
+	if (!ctl.quiet) {
+		if (ctl.stream) {
+			printf(_("Script started, streaming command is %s\n"), ctl.streamcmd[0]);
+		} else {
+			printf(_("Script started, file is %s\n"), ctl.fname);
+		}
+	}
 	enable_rawmode_tty(&ctl);
 
 #ifdef HAVE_LIBUTEMPTER
