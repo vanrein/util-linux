@@ -202,8 +202,8 @@ can read more input than you would expect.
 .PP
 An example of a
 .B scriptstream
-command that would stream information to a certain port on a
-certain server could be
+command that an admin might create to stream information to
+a locally meaningful server port could be
 .RS
 .RE
 .sp
@@ -212,9 +212,9 @@ certain server could be
 .nf
 #!/bin/sh
 #
-# /usr/local/bin/scriptstream -- used for "script -s"
+# /usr/local/bin/scriptstream -- uses "script --stream"
 #
-nc -q0 2001:db8::1234 5678 | sed 's/$/\\r/'
+script -s -- nc -q0 2001:db8::1234 5678 | sed 's/$/\\r/'
 .fi
 .RE
 .ad
@@ -222,7 +222,13 @@ nc -q0 2001:db8::1234 5678 | sed 's/$/\\r/'
 Note how
 .IR nc (1)
 is said to terminate when reading EOF, and line endings of
-any output is mapped from LF to CRLF.
+any output is mapped from LF to CRLF.  Also note the use
+of two dashes to separate
+.IR nc (1)
+options and stop their interpretation by the
+.B
+script
+command.
 .SH ENVIRONMENT
 The following environment variable is utilized by
 .BR script :

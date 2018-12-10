@@ -100,16 +100,13 @@ UL_DEBUG_DEFINE_MASKNAMES(script) = UL_DEBUG_EMPTY_MASKNAMES;
 #endif
 
 #define DEFAULT_TYPESCRIPT_FILENAME "typescript"
-#define DEFAULT_TYPESCRIPT_COMMAND  "scriptstream"
 
 struct script_control {
 	char *shell;		/* shell to be executed */
 	char *command;		/* command to be executed */
 	char *fname;		/* output file path */
 	FILE *typescriptfp;	/* output file pointer */
-	int stream;		/* output to streaming command */
 	char **streamcmd;	/* streaming command */
-	char *minicmd [2];	/* storage for a mini streaming command */
 	char *tname;		/* timing file path */
 	FILE *timingfp;		/* timing file pointer */
 	uint64_t outsz;         /* current output file size */
@@ -133,6 +130,7 @@ struct script_control {
 	 flush:1,		/* flush after each write */
 	 quiet:1,		/* suppress most output */
 	 timing:1,		/* include timing file */
+	 stream:1,		/* output to streaming command */
 	 force:1,		/* write output to links */
 	 isterm:1,		/* is child process running as terminal */
 	 die:1;			/* terminate program */
@@ -505,7 +503,10 @@ static void handle_signal(struct script_control *ctl, int fd)
 		    || info.ssi_code == CLD_KILLED
 		    || info.ssi_code == CLD_DUMPED) {
 			wait_for_child(ctl, 0);
-			wait_for_stream_cmd(ctl, 0);
+			if (ctl->stream) {
+				wait_for_stream_cmd(ctl, 0);
+printf ("wait_for_stream_cmd(ctl,0) done\n");
+			}
 			ctl->poll_timeout = 10;
 
 		/* In case of ssi_code is CLD_TRAPPED, CLD_STOPPED, or CLD_CONTINUED */
@@ -537,12 +538,13 @@ static void handle_signal(struct script_control *ctl, int fd)
 		abort();
 	}
 	DBG(SIGNAL, ul_debug("signal handle on FD %d done", fd));
+printf ("signal handled\n");
 }
 
 static void do_io(struct script_control *ctl)
 {
 	int ret, eof = 0;
-	int cmdio[2];
+	int stream_pipe[2];
 	time_t tvec = script_time((time_t *)NULL);
 	enum {
 		POLLFD_SIGNAL = 0,
@@ -558,7 +560,7 @@ static void do_io(struct script_control *ctl)
 
 
 	if (ctl->stream) {
-		if (pipe(cmdio) == -1) {
+		if (pipe(stream_pipe) == -1) {
 			warn(_("pipe failed"));
 			fail(ctl);
 			exit(1);
@@ -570,15 +572,14 @@ static void do_io(struct script_control *ctl)
 			fail(ctl);
 			exit(1);
 		case 0: /* child */
-			close(cmdio[1]);
-			dup2(cmdio[0],0);
+			close(stream_pipe[1]);
+			dup2(stream_pipe[0],0);
 			execvp(ctl->streamcmd[0], ctl->streamcmd);
-			fprintf(stderr,_("streaming command failed: %s\r\n"),strerror(errno));
-			exit(1);
+			err(EXIT_FAILURE, _("streaming command failed"));
 			break;
 		default: /* parent */
-			close(cmdio[0]);
-			ctl->typescriptfp = fdopen(cmdio[1],"w");
+			close(stream_pipe[0]);
+			ctl->typescriptfp = fdopen(stream_pipe[1],"w");
 		}
 	} else {
 		ctl->typescriptfp = fopen(ctl->fname, ctl->append ? "a" UL_CLOEXECSTR : "w" UL_CLOEXECSTR);
@@ -609,11 +610,14 @@ static void do_io(struct script_control *ctl)
 		int errsv;
 
 		DBG(POLL, ul_debug("calling poll()"));
+printf ("calling poll()\r\n");
 
 		/* wait for input or signal */
 		ret = poll(pfd, ARRAY_SIZE(pfd), ctl->poll_timeout);
 		errsv = errno;
 		DBG(POLL, ul_debug("poll() rc=%d", ret));
+// last: rc==2 -> segfault; rc==0 --> good  (so problems with POLLFD_STDIN)
+printf ("poll() rc=%d\r\n", ret);
 
 		if (ret < 0) {
 			if (errsv == EAGAIN)
@@ -644,7 +648,10 @@ static void do_io(struct script_control *ctl)
 			case POLLFD_MASTER:
 				/* data */
 				if (pfd[i].revents & POLLIN)
+{
 					handle_io(ctl, pfd[i].fd, &eof);
+printf("handled IO, EOF now is %d\r\n", eof);
+}
 				/* EOF maybe detected by two ways:
 				 *	A) poll() return POLLHUP event after close()
 				 *	B) read() returns 0 (no data) */
@@ -653,12 +660,14 @@ static void do_io(struct script_control *ctl)
 					pfd[i].fd = -1;
 					if (i == POLLFD_STDIN) {
 						write_eof_to_shell(ctl);
+printf ("written EOF to shell\r\n");
 						DBG(POLL, ul_debug("  ignore STDIN"));
 					}
 				}
 				continue;
 			case POLLFD_SIGNAL:
 				handle_signal(ctl, pfd[i].fd);
+printf ("handled signal\r\n");
 				break;
 			}
 		}
@@ -671,8 +680,10 @@ static void do_io(struct script_control *ctl)
 
 	done(ctl);
 
+printf ("waiting for the stream to end\n");
 	if (ctl->stream)
 		wait_for_stream_cmd(ctl, 1);
+printf ("waited  for the stream to end\n");
 }
 
 static void getslave(struct script_control *ctl)
@@ -895,30 +906,14 @@ int main(int argc, char **argv)
 	argv += optind;
 	assert (argv [argc] == NULL);
 
-	/* streaming may be ordered with option --stream or with argc > 1 */
-	if (argc == 0) {
-		if (ctl.stream) {
-			ctl.minicmd[0] = DEFAULT_TYPESCRIPT_COMMAND;
-			ctl.minicmd[1] = NULL;
-			ctl.streamcmd = &ctl.minicmd[0];
-		} else {
-			/* No default implementation to make this pluggable */
-			ctl.fname = DEFAULT_TYPESCRIPT_FILENAME;
-			die_if_link(&ctl);
-		}
-	} else if (argc == 1) {
-		if (ctl.stream) {
-			ctl.minicmd[0] = argv[0];
-			ctl.minicmd[1] = NULL;
-			ctl.streamcmd = &ctl.minicmd[0];
-		} else {
+	if (argc > 0) {
+		if (ctl.stream)
+			ctl.streamcmd = &argv[0];
+		else
 			ctl.fname = argv[0];
-		}
 	} else {
-		/* implicit streaming for more than 1 command argument */
-		ctl.streamcmd = argv;
-		ctl.stream = 1;
-		ctl.flush = 1;
+		ctl.fname = DEFAULT_TYPESCRIPT_FILENAME;
+		die_if_link(&ctl);
 	}
 
 	ctl.shell = getenv("SHELL");
@@ -968,9 +963,11 @@ int main(int argc, char **argv)
 		break;
 	default: /* parent */
 		do_io(&ctl);
+printf ("done_io()\n");
 		break;
 	}
 
 	/* should not happen, all used functions are non-return */
+printf ("we found our way out of the maze, with ctl.child==%d\n", ctl.child);
 	return EXIT_FAILURE;
 }
